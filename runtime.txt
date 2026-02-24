@@ -1,5 +1,1 @@
-<<<<<<< HEAD
 python-3.11.9
-=======
-python-3.11.9
->>>>>>> 9c8091b (Update bot to webhook mode)

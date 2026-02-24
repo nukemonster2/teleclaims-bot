@@ -8,8 +8,8 @@ from telegram.ext import (
 import os
 
 TOKEN = os.getenv("TOKEN")
-ADMIN_IDS = list(map(int, os.getenv("ADMIN_IDS", "").split(",")))
-
+admin_env = os.getenv("ADMIN_IDS", "")
+ADMIN_IDS = [int(x) for x in admin_env.split(",") if x.strip().isdigit()]
 
 conn = sqlite3.connect("claims.db", check_same_thread=False)
 cursor = conn.cursor()
