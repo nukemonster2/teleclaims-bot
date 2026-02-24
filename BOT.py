@@ -138,4 +138,11 @@ app.add_handler(CommandHandler("approve", approve))
 app.add_handler(CommandHandler("reject", reject))
 app.add_handler(CommandHandler("list", list_requests))
 app.add_handler(CommandHandler("help", help_command))
-app.run_polling()
+PORT = int(os.environ.get("PORT", 10000))
+RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL")
+
+app.run_webhook(
+    listen="0.0.0.0",
+    port=PORT,
+    webhook_url=f"{RENDER_EXTERNAL_URL}",
+)
