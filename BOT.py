@@ -127,11 +127,12 @@ app.add_handler(CommandHandler("reject", reject))
 app.add_handler(CommandHandler("list", list_requests))
 app.add_handler(MessageHandler(filters.PHOTO, upload_receipt))
 
-# --- Webhook Setup ---
 PORT = int(os.environ.get("PORT", 10000))
-RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL")
+RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL")  # e.g., https://teleclaims-bot.onrender.com
+
 app.run_webhook(
     listen="0.0.0.0",
     port=PORT,
-    webhook_url=RENDER_EXTERNAL_URL,
+    url_path=TOKEN,            # <-- IMPORTANT: set url_path to your bot token
+    webhook_url=f"{RENDER_EXTERNAL_URL}/{TOKEN}"  # <-- Telegram POSTs here
 )
