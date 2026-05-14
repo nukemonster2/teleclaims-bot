@@ -251,64 +251,54 @@ def extract_text_from_ocr_response(result):
 
 
 def extract_items_and_total(text):
-    lines = text.splitlines()
-
-    items = []
-    detected_total = None
+    lines = [l.strip() for l in text.splitlines() if l.strip()]
 
     IGNORE_WORDS = {
-        "cash",
-        "change",
-        "subtotal",
-        "tax",
-        "amount",
-        "balance",
-        "visa",
-        "mastercard",
+        "cash", "change", "subtotal", "tax", "total", "amount",
+        "receipt", "thank you"
     }
 
+    item_lines = []
+    price_lines = []
+
+    # Step 1: split text into item vs price candidates
     for line in lines:
-        line = line.strip()
+        lower = line.lower()
 
-        # Skip empty or tiny garbage lines
-        if len(line) < 4:
+        # capture prices like 35.00 or $ 35.00
+        price_match = re.fullmatch(r"\$?\s*(\d+\.\d{2})", line)
+        if price_match:
+            price_lines.append(float(price_match.group(1)))
             continue
 
-        # Match item + price
-        match = re.search(r"^(.+?)\s+\$?\s*(\d+\.\d{2})$", line)
-
-        if not match:
+        # skip junk lines
+        if any(w in lower for w in IGNORE_WORDS):
             continue
 
-        item_name = match.group(1).strip()
-        price = float(match.group(2))
-
-        lower_name = item_name.lower()
-
-        # Ignore broken OCR symbols
-        if lower_name in {"$", "s"}:
+        # skip pure symbols
+        if not re.search(r"[a-zA-Z]", line):
             continue
 
-        # Detect TOTAL separately
-        if "total" in lower_name:
-            detected_total = price
-            continue
+        item_lines.append(line)
 
-        # Ignore non-item payment lines
-        if any(word in lower_name for word in IGNORE_WORDS):
-            continue
+    # Step 2: pair items with prices
+    items = []
+    for i in range(min(len(item_lines), len(price_lines))):
+        item_name = item_lines[i]
 
-        # Require actual letters in item name
-        if not re.search(r"[a-zA-Z]", item_name):
-            continue
+        # clean OCR mistakes
+        item_name = (
+            item_name.replace("lx", "1x")
+                     .replace("Ix", "1x")
+                     .replace("s", "")
+                     .strip()
+        )
 
-        items.append((item_name, price))
+        items.append((item_name, price_lines[i]))
 
-    # Use detected total if available
-    if detected_total is not None:
-        total = detected_total
-    else:
-        total = sum(price for _, price in items)
+    # Step 3: detect TOTAL separately
+    total_match = re.search(r"(\d+\.\d{2})\s*$", text.split("TOTAL")[-1])
+    total = float(total_match.group(1)) if total_match else sum(p for _, p in items)
 
     return items, total
 
