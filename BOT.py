@@ -42,6 +42,13 @@ cursor.execute(
 )
 conn.commit()
 
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+PRICE_RE = re.compile(r"\$?\s*(\d+\.\d{2})")
+IGNORE_KEYWORDS = {"cash", "change", "subtotal", "tax", "total", "amount", "receipt", "thank you"}
+
 
 def format_request(row):
     return (
@@ -83,6 +90,104 @@ def parse_request_args(args):
     return item, link, price
 
 
+# ---------------------------------------------------------------------------
+# Receipt OCR parsing
+# ---------------------------------------------------------------------------
+
+def extract_text_from_ocr_response(result):
+    if not isinstance(result, dict):
+        return None
+    parsed = result.get("ParsedResults")
+    if not parsed:
+        return None
+    return parsed[0].get("ParsedText")
+
+
+def is_ignored_line(line):
+    """Return True if the line is a footer/summary line that should be skipped."""
+    lower = line.lower()
+    return any(word in lower for word in IGNORE_KEYWORDS)
+
+
+def extract_items_and_total(text):
+    """
+    Parse receipt text into (items, total).
+
+    Handles two common OCR layouts:
+      Layout A - price is inline:    "1x Lorem ipsum $ 35.00"
+      Layout B - price on next line: "1x Lorem ipsum\\n35.00"
+    """
+    lines = [l.strip() for l in text.splitlines() if l.strip()]
+
+    # --- Step 1: find the receipt total ---
+    total = None
+    for i, line in enumerate(lines):
+        if "total" in line.lower():
+            # Price may be on the same line: "TOTAL AMOUNT $ 117.00"
+            m = PRICE_RE.search(line)
+            if m:
+                total = float(m.group(1))
+                break
+            # Otherwise check up to 2 lines ahead
+            for j in range(i + 1, min(i + 3, len(lines))):
+                m = PRICE_RE.search(lines[j])
+                if m:
+                    total = float(m.group(1))
+                    break
+            if total is not None:
+                break
+
+    # --- Step 2: classify each line ---
+    inline_items = []       # lines with both a name and a price  (Layout A)
+    name_only_lines = []    # lines with only a name              (Layout B)
+    standalone_prices = []  # lines with only a price             (Layout B)
+
+    for line in lines:
+        if is_ignored_line(line):
+            continue
+
+        has_letters = bool(re.search(r"[a-zA-Z]", line))
+        price_match = PRICE_RE.search(line)
+        is_price_only = bool(re.fullmatch(r"[\$\s\d\.]+", line))
+
+        if price_match and has_letters and not is_price_only:
+            # Layout A: "1x Lorem ipsum $ 35.00"
+            inline_items.append(line)
+        elif price_match and is_price_only:
+            # Layout B price line: "35.00"
+            standalone_prices.append(float(price_match.group(1)))
+        elif has_letters:
+            # Layout B name line: "1x Lorem ipsum"
+            name_only_lines.append(line)
+
+    # --- Step 3: build item list from whichever layout was detected ---
+    items = []
+
+    if inline_items:
+        # Layout A: strip the price from the end of the line to get the item name
+        for line in inline_items:
+            m = PRICE_RE.search(line)
+            price = float(m.group(1))
+            name = PRICE_RE.sub("", line).replace("$", "").strip().rstrip("-").strip()
+            name = name.replace("lx", "1x").replace("Ix", "1x")
+            items.append((name, price))
+    else:
+        # Layout B: pair name lines with standalone price lines in order
+        for i in range(min(len(name_only_lines), len(standalone_prices))):
+            name = name_only_lines[i].replace("lx", "1x").replace("Ix", "1x").strip()
+            items.append((name, standalone_prices[i]))
+
+    # Fallback: if no total was found, sum the item prices
+    if total is None:
+        total = sum(p for _, p in items)
+
+    return items, total
+
+
+# ---------------------------------------------------------------------------
+# Command handlers
+# ---------------------------------------------------------------------------
+
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     help_text = (
@@ -119,7 +224,6 @@ async def request_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         (user.id, user.username, item, link, price, "PENDING"),
     )
     conn.commit()
-
     await update.message.reply_text(
         f"Request created:\nItem: {item}\nLink: {link}\nPrice: ${price:.2f}\nStatus: PENDING"
     )
@@ -189,7 +293,10 @@ async def list_requests(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id in ADMIN_IDS and context.args and context.args[0].lower() == "all":
         cursor.execute("SELECT * FROM requests ORDER BY id")
     else:
-        cursor.execute("SELECT * FROM requests WHERE user_id=? ORDER BY id", (update.effective_user.id,))
+        cursor.execute(
+            "SELECT * FROM requests WHERE user_id=? ORDER BY id",
+            (update.effective_user.id,),
+        )
 
     rows = cursor.fetchall()
     if not rows:
@@ -241,90 +348,6 @@ async def pending_requests(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(chunk)
 
 
-def extract_text_from_ocr_response(result):
-    if not isinstance(result, dict):
-        return None
-    parsed = result.get("ParsedResults")
-    if not parsed:
-        return None
-    return parsed[0].get("ParsedText")
-
-
-def extract_items_and_total(text):
-    lines = [l.strip() for l in text.splitlines() if l.strip()]
-
-    IGNORE_KEYWORDS = {
-        "cash", "change", "subtotal", "tax",
-        "total", "amount", "receipt", "thank you"
-    }
-
-    def is_standalone_price(line):
-        """Line is purely a price value with no item name."""
-        return re.fullmatch(r"\$?\s*\d+\.\d{2}", line) is not None
-
-    def is_junk_item(line):
-        lower = line.lower()
-
-        # Reject lines containing ignored keywords
-        if any(word in lower for word in IGNORE_KEYWORDS):
-            return True
-
-        # Reject modifier/adjustment lines
-        if "modif" in lower:
-            return True
-
-        # Reject lines with no letters at all
-        if not re.search(r"[a-zA-Z]", line):
-            return True
-
-        # FIX: Reject lines where a price appears very early (e.g. "s 117.00", "117.00 item")
-        # Allow at most 3 non-alpha characters before the first digit of a price pattern
-        if re.match(r"^[^a-zA-Z]{0,3}\d+\.\d{2}", line):
-            return True
-
-        return False
-
-    item_lines = []
-    price_lines = []
-
-    for line in lines:
-        if is_standalone_price(line):
-            price_lines.append(float(re.search(r"\d+\.\d{2}", line).group()))
-        elif not is_junk_item(line):
-            item_lines.append(line)
-
-    # Pair item names with prices
-    items = []
-    for i in range(min(len(item_lines), len(price_lines))):
-        name = item_lines[i]
-        price = price_lines[i]
-        name = name.replace("lx", "1x").replace("Ix", "1x").strip()
-        items.append((name, price))
-
-    # FIX: Extract total — check the "total" line itself first, then the next line
-    total = None
-    for i, line in enumerate(lines):
-        if "total" in line.lower():
-            # Price may be on the same line (e.g. "TOTAL AMOUNT $ 117.00")
-            m = re.search(r"\d+\.\d{2}", line)
-            if m:
-                total = float(m.group())
-                break
-            # Otherwise check the next line
-            for j in range(i + 1, len(lines)):
-                m = re.search(r"\d+\.\d{2}", lines[j])
-                if m:
-                    total = float(m.group())
-                    break
-            break
-
-    # Final fallback: sum up the extracted item prices
-    if total is None:
-        total = sum(p for _, p in items)
-
-    return items, total
-
-
 async def upload_receipt(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message.photo:
         await update.message.reply_text("Please send a photo of the receipt.")
@@ -367,15 +390,16 @@ async def upload_receipt(update: Update, context: ContextTypes.DEFAULT_TYPE):
     items, total = extract_items_and_total(text)
 
     if not items:
-        await update.message.reply_text(
-            f"Extracted text:\n{text}\n\nNo item prices detected."
-        )
+        await update.message.reply_text(f"Extracted text:\n{text}\n\nNo item prices detected.")
         return
 
     formatted = "\n".join(f"{name} - ${price:.2f}" for name, price in items)
-    message = f"Extracted items:\n\n{formatted}\n\nTOTAL: ${total:.2f}"
-    await update.message.reply_text(message)
+    await update.message.reply_text(f"Extracted items:\n\n{formatted}\n\nTOTAL: ${total:.2f}")
 
+
+# ---------------------------------------------------------------------------
+# App bootstrap
+# ---------------------------------------------------------------------------
 
 def build_application():
     application = ApplicationBuilder().token(TOKEN).build()
