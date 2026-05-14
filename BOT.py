@@ -3,37 +3,61 @@ import re
 import sqlite3
 import tempfile
 import logging
+import threading
+
+from fastapi import FastAPI
+import uvicorn
 
 from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram.ext import (
+    ApplicationBuilder,
+    CommandHandler,
+    MessageHandler,
+    ContextTypes,
+    filters,
+)
 
 from paddleocr import PaddleOCR
 
-# ---------------------------------------------------------------------------
+# -------------------------------------------------------------------
 # CONFIG
-# ---------------------------------------------------------------------------
+# -------------------------------------------------------------------
 
 TOKEN = os.getenv("TOKEN")
-ADMIN_IDS = [int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()]
-
-PORT = int(os.environ.get("PORT", 10000))
-RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL")
-
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+PORT = int(os.getenv("PORT", 10000))
 
 if not TOKEN:
     raise SystemExit("Missing TOKEN")
 
-# ---------------------------------------------------------------------------
-# OCR INIT (PaddleOCR)
-# ---------------------------------------------------------------------------
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-ocr = PaddleOCR(use_angle_cls=True, lang="en")
+# -------------------------------------------------------------------
+# FASTAPI (Render needs this)
+# -------------------------------------------------------------------
 
-# ---------------------------------------------------------------------------
+app_web = FastAPI()
+
+@app_web.get("/")
+def health():
+    return {"status": "ok"}
+
+# -------------------------------------------------------------------
+# LAZY OCR (IMPORTANT FOR RENDER)
+# -------------------------------------------------------------------
+
+ocr = None
+
+def get_ocr():
+    global ocr
+    if ocr is None:
+        logger.info("Loading PaddleOCR model...")
+        ocr = PaddleOCR(use_angle_cls=True, lang="en")
+    return ocr
+
+# -------------------------------------------------------------------
 # DATABASE
-# ---------------------------------------------------------------------------
+# -------------------------------------------------------------------
 
 conn = sqlite3.connect("claims.db", check_same_thread=False)
 cursor = conn.cursor()
@@ -51,22 +75,52 @@ CREATE TABLE IF NOT EXISTS requests (
 """)
 conn.commit()
 
-# ---------------------------------------------------------------------------
-# REGEX
-# ---------------------------------------------------------------------------
+# -------------------------------------------------------------------
+# OCR PARSER HELPERS
+# -------------------------------------------------------------------
 
 PRICE_RE = re.compile(r"\$?\s*(\d+\.\d{2})")
-
 IGNORE_WORDS = {"cash", "change", "subtotal", "tax", "total", "thank"}
 
-# ---------------------------------------------------------------------------
-# HELPERS
-# ---------------------------------------------------------------------------
-
 def clean_lines(text: str):
-    lines = [l.strip() for l in text.split("\n") if l.strip()]
-    return lines
+    return [l.strip() for l in text.split("\n") if l.strip()]
 
+def extract_items_and_total(text: str):
+    lines = clean_lines(text)
+
+    items = []
+    total = None
+
+    for line in lines:
+        low = line.lower()
+
+        if "total" in low:
+            m = PRICE_RE.search(line)
+            if m:
+                total = float(m.group(1))
+            continue
+
+        if any(w in low for w in IGNORE_WORDS):
+            continue
+
+        m = PRICE_RE.search(line)
+        if not m:
+            continue
+
+        price = float(m.group(1))
+        name = PRICE_RE.sub("", line).replace("$", "").strip()
+        name = re.sub(r"^\d+\s*x\s*", "", name, flags=re.IGNORECASE)
+
+        if len(name) < 2:
+            continue
+
+        items.append({"name": name, "price": price})
+
+    computed_total = sum(i["price"] for i in items)
+    if total is None:
+        total = computed_total
+
+    return items, total
 
 def format_receipt(items, total):
     col = max((len(i["name"]) for i in items), default=10)
@@ -83,63 +137,14 @@ def format_receipt(items, total):
 
     return "```\n" + "\n".join([header, sep] + rows + [sep, footer]) + "\n```"
 
-# ---------------------------------------------------------------------------
-# RECEIPT PARSER (ROBUST)
-# ---------------------------------------------------------------------------
+# -------------------------------------------------------------------
+# TELEGRAM HANDLERS
+# -------------------------------------------------------------------
 
-def extract_items_and_total(text: str):
-    lines = clean_lines(text)
-
-    items = []
-    total = None
-
-    for line in lines:
-        low = line.lower()
-
-        # capture total
-        if "total" in low:
-            m = PRICE_RE.search(line)
-            if m:
-                total = float(m.group(1))
-            continue
-
-        # ignore footer noise
-        if any(w in low for w in IGNORE_WORDS):
-            continue
-
-        m = PRICE_RE.search(line)
-        if not m:
-            continue
-
-        price = float(m.group(1))
-
-        name = PRICE_RE.sub("", line).replace("$", "").strip()
-
-        # remove fake OCR quantity like "2x"
-        name = re.sub(r"^\d+\s*x\s*", "", name, flags=re.IGNORECASE)
-
-        if len(name) < 2:
-            continue
-
-        items.append({
-            "name": name,
-            "qty": 1,
-            "price": price
-        })
-
-    computed_total = sum(i["price"] for i in items)
-
-    if total is None:
-        total = computed_total
-
-    return items, total
-
-# ---------------------------------------------------------------------------
-# TELEGRAM HANDLER
-# ---------------------------------------------------------------------------
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Receipt bot is running.")
 
 async def upload_receipt(update: Update, context: ContextTypes.DEFAULT_TYPE):
-
     if not update.message.photo:
         return await update.message.reply_text("Send a receipt image.")
 
@@ -150,9 +155,9 @@ async def upload_receipt(update: Update, context: ContextTypes.DEFAULT_TYPE):
         path = f.name
 
     try:
-        result = ocr.ocr(path, cls=True)
+        ocr_engine = get_ocr()
+        result = ocr_engine.ocr(path, cls=True)
 
-        # flatten OCR output
         lines = []
         for block in result:
             for line in block:
@@ -182,18 +187,11 @@ async def upload_receipt(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown"
     )
 
-# ---------------------------------------------------------------------------
-# BASIC COMMANDS (kept minimal)
-# ---------------------------------------------------------------------------
+# -------------------------------------------------------------------
+# TELEGRAM APP
+# -------------------------------------------------------------------
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Receipt bot is running.")
-
-# ---------------------------------------------------------------------------
-# BUILD APP
-# ---------------------------------------------------------------------------
-
-def build_app():
+def build_bot():
     app = ApplicationBuilder().token(TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
@@ -201,10 +199,17 @@ def build_app():
 
     return app
 
-def run():
-    app = build_app()
-    logger.info("Bot running in polling mode")
-    app.run_polling()
+def run_bot():
+    bot = build_bot()
+    logger.info("Bot running (polling mode)")
+    bot.run_polling()
+
+# -------------------------------------------------------------------
+# ENTRYPOINT (RENDER SAFE)
+# -------------------------------------------------------------------
 
 if __name__ == "__main__":
-    run()
+    threading.Thread(target=run_bot).start()
+
+    logger.info("Starting FastAPI server...")
+    uvicorn.run(app_web, host="0.0.0.0", port=PORT)
