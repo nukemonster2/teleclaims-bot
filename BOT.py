@@ -205,3 +205,6 @@ def run():
     app = build_app()
     logger.info("Bot running in polling mode")
     app.run_polling()
+
+if __name__ == "__main__":
+    run()
