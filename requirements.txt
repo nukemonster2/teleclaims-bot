@@ -1,8 +1,2 @@
-python-telegram-bot==20.7
-paddleocr
-paddlepaddle
-fastapi
-uvicorn
-numpy
-Pillow
-opencv-python-headless
+python-telegram-bot[webhooks]==20.3
+requests
