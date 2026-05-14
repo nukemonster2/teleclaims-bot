@@ -3,10 +3,11 @@ import re
 import sqlite3
 import tempfile
 import logging
-import requests
 
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
+
+from paddleocr import PaddleOCR
 
 # ---------------------------------------------------------------------------
 # CONFIG
@@ -14,7 +15,6 @@ from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, fil
 
 TOKEN = os.getenv("TOKEN")
 ADMIN_IDS = [int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()]
-OCR_API_KEY = os.getenv("OCR_API_KEY")
 
 PORT = int(os.environ.get("PORT", 10000))
 RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL")
@@ -26,7 +26,13 @@ if not TOKEN:
     raise SystemExit("Missing TOKEN")
 
 # ---------------------------------------------------------------------------
-# DB
+# OCR INIT (PaddleOCR)
+# ---------------------------------------------------------------------------
+
+ocr = PaddleOCR(use_angle_cls=True, lang="en")
+
+# ---------------------------------------------------------------------------
+# DATABASE
 # ---------------------------------------------------------------------------
 
 conn = sqlite3.connect("claims.db", check_same_thread=False)
@@ -51,63 +57,54 @@ conn.commit()
 
 PRICE_RE = re.compile(r"\$?\s*(\d+\.\d{2})")
 
-IGNORE = {"cash", "change", "subtotal", "tax", "total", "thank"}
+IGNORE_WORDS = {"cash", "change", "subtotal", "tax", "total", "thank"}
 
 # ---------------------------------------------------------------------------
 # HELPERS
 # ---------------------------------------------------------------------------
 
-def chunk_text(text, limit=4000):
-    out = []
-    while text:
-        out.append(text[:limit])
-        text = text[limit:]
-    return out
+def clean_lines(text: str):
+    lines = [l.strip() for l in text.split("\n") if l.strip()]
+    return lines
 
 
-def format_request(row):
-    return (
-        f"ID: {row[0]}\n"
-        f"User: {row[2] or 'unknown'} ({row[1]})\n"
-        f"Item: {row[3]}\n"
-        f"Link: {row[4]}\n"
-        f"Price: ${row[5]:.2f}\n"
-        f"Status: {row[6]}"
-    )
+def format_receipt(items, total):
+    col = max((len(i["name"]) for i in items), default=10)
+
+    header = f"{'Item':<{col}}  {'Price':>10}"
+    sep = "-" * len(header)
+
+    rows = [
+        f"{i['name']:<{col}}  ${i['price']:>9.2f}"
+        for i in items
+    ]
+
+    footer = f"{'TOTAL':<{col}}  ${total:>9.2f}"
+
+    return "```\n" + "\n".join([header, sep] + rows + [sep, footer]) + "\n```"
 
 # ---------------------------------------------------------------------------
-# OCR PARSER (FIXED CORE LOGIC)
+# RECEIPT PARSER (ROBUST)
 # ---------------------------------------------------------------------------
-
-def clean_line(line: str) -> str:
-    line = line.strip()
-    line = re.sub(r"\s+", " ", line)
-    return line
-
-
-def is_noise(line: str) -> bool:
-    l = line.lower()
-    return any(k in l for k in IGNORE)
-
 
 def extract_items_and_total(text: str):
-    lines = [l.strip() for l in text.splitlines() if l.strip()]
+    lines = clean_lines(text)
 
     items = []
     total = None
 
     for line in lines:
-        lower = line.lower()
+        low = line.lower()
 
-        # capture total safely
-        if "total" in lower:
+        # capture total
+        if "total" in low:
             m = PRICE_RE.search(line)
             if m:
                 total = float(m.group(1))
             continue
 
         # ignore footer noise
-        if any(k in lower for k in ["cash", "change", "subtotal", "tax", "thank"]):
+        if any(w in low for w in IGNORE_WORDS):
             continue
 
         m = PRICE_RE.search(line)
@@ -116,11 +113,9 @@ def extract_items_and_total(text: str):
 
         price = float(m.group(1))
 
-        # remove price from name
-        name = PRICE_RE.sub("", line)
-        name = name.replace("$", "").strip()
+        name = PRICE_RE.sub("", line).replace("$", "").strip()
 
-        # remove fake qty like "2x"
+        # remove fake OCR quantity like "2x"
         name = re.sub(r"^\d+\s*x\s*", "", name, flags=re.IGNORECASE)
 
         if len(name) < 2:
@@ -140,34 +135,13 @@ def extract_items_and_total(text: str):
     return items, total
 
 # ---------------------------------------------------------------------------
-# FORMAT OUTPUT
-# ---------------------------------------------------------------------------
-
-def format_receipt(items, total):
-    col = max(len(i["name"]) for i in items) if items else 10
-    header = f"{'Item':<{col}}  {'Price':>10}"
-    sep = "-" * len(header)
-
-    rows = [
-        f"{i['name']:<{col}}  ${i['price']:>9.2f}"
-        for i in items
-    ]
-
-    footer = f"{'TOTAL':<{col}}  ${total:>9.2f}"
-
-    return "```\n" + "\n".join([header, sep] + rows + [sep, footer]) + "\n```"
-
-# ---------------------------------------------------------------------------
-# TELEGRAM HANDLERS
+# TELEGRAM HANDLER
 # ---------------------------------------------------------------------------
 
 async def upload_receipt(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not update.message.photo:
-        return await update.message.reply_text("Send a receipt photo.")
-
-    if not OCR_API_KEY:
-        return await update.message.reply_text("OCR not configured.")
+        return await update.message.reply_text("Send a receipt image.")
 
     file = await update.message.photo[-1].get_file()
 
@@ -176,23 +150,32 @@ async def upload_receipt(update: Update, context: ContextTypes.DEFAULT_TYPE):
         path = f.name
 
     try:
-        with open(path, "rb") as img:
-            r = requests.post(
-                "https://api.ocr.space/parse/image",
-                files={"file": img},
-                data={"apikey": OCR_API_KEY, "language": "eng"},
-                timeout=30
-            )
-        data = r.json()
-    finally:
-        os.remove(path)
+        result = ocr.ocr(path, cls=True)
 
-    text = data["ParsedResults"][0]["ParsedText"]
+        # flatten OCR output
+        lines = []
+        for block in result:
+            for line in block:
+                lines.append(line[1][0])
+
+        text = "\n".join(lines)
+
+    except Exception as e:
+        logger.exception(e)
+        return await update.message.reply_text("OCR failed.")
+
+    finally:
+        try:
+            os.remove(path)
+        except:
+            pass
 
     items, total = extract_items_and_total(text)
 
     if not items:
-        return await update.message.reply_text("No items detected.")
+        return await update.message.reply_text(
+            f"OCR TEXT:\n{text}\n\nNo items detected."
+        )
 
     await update.message.reply_text(
         format_receipt(items, total),
@@ -200,12 +183,22 @@ async def upload_receipt(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 # ---------------------------------------------------------------------------
-# BASIC BOT SETUP
+# BASIC COMMANDS (kept minimal)
+# ---------------------------------------------------------------------------
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Receipt bot is running.")
+
+# ---------------------------------------------------------------------------
+# BUILD APP
 # ---------------------------------------------------------------------------
 
 def build_app():
     app = ApplicationBuilder().token(TOKEN).build()
+
+    app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.PHOTO, upload_receipt))
+
     return app
 
 
