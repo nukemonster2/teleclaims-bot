@@ -77,17 +77,14 @@ def chunk_text(text, limit=4000):
 def parse_request_args(args):
     if len(args) < 3:
         raise ValueError("Usage: /request <item> <link> <price>")
-
     try:
         price = float(args[-1])
     except ValueError:
         raise ValueError("Price must be a number.")
-
     link = args[-2]
     item = " ".join(args[:-2]).strip()
     if not item:
         raise ValueError("Item description cannot be empty.")
-
     return item, link, price
 
 
@@ -105,27 +102,32 @@ def extract_text_from_ocr_response(result):
 
 
 def is_ignored_line(line):
-    """Return True for footer/summary lines that should be skipped."""
+    """Return True for footer/summary lines (cash, change, total, etc.)."""
     lower = line.lower()
     return any(word in lower for word in IGNORE_KEYWORDS)
 
 
 def is_currency_noise(line):
     """
-    Detect lines where the only 'letter' is a lone OCR misread of the $ symbol.
-    OCR engines frequently read '$' as 's' or 'S', producing lines like:
-      's 117.00'  or  'S 35.00'
-    After stripping the price, a real item line always has more than 1 character
-    of meaningful text remaining.
+    Detect lines where the only letter is an OCR misread of '$' as 's'/'S'.
+    e.g. 's 117.00' -> after stripping price -> 's' -> length 1 -> noise.
     """
     without_price = PRICE_RE.sub("", line).replace("$", "").strip()
     return len(without_price) <= 1
 
 
+def is_watermark_or_domain(token):
+    """
+    Detect single-token domain/watermark strings like 'modif.ai' or 'store.com'.
+    These have no spaces and match a valid domain pattern.
+    """
+    return bool(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9.\-]*\.[A-Za-z]{2,}", token.strip()))
+
+
 def _parse_name_qty(raw_name):
     """
     Split '2x Lorem ipsum' into ('Lorem ipsum', 2).
-    Returns (raw_name, 1) if no leading quantity prefix is found.
+    Returns (raw_name, 1) if no quantity prefix is found.
     """
     raw_name = raw_name.replace("lx", "1x").replace("Ix", "1x").strip()
     m = QTY_RE.match(raw_name)
@@ -134,21 +136,74 @@ def _parse_name_qty(raw_name):
     return raw_name, 1
 
 
+def _classify_lines(lines):
+    """
+    Classify receipt lines into three buckets:
+      - inline_items:      name + price on same line  (Layout A)
+      - name_only_lines:   name only                  (Layout B)
+      - standalone_prices: price only                 (Layout B)
+
+    ignore_next_price tracks when a standalone price line immediately follows
+    an ignored keyword line (e.g. CASH on one line, $200 on the next) so that
+    orphaned prices are not mistakenly paired with item names.
+    """
+    ignore_next_price = False
+    inline_items      = []
+    name_only_lines   = []
+    standalone_prices = []
+
+    for line in lines:
+        if is_ignored_line(line):
+            ignore_next_price = True
+            continue
+
+        has_letters   = bool(re.search(r"[a-zA-Z]", line))
+        price_match   = PRICE_RE.search(line)
+        is_price_only = bool(re.fullmatch(r"[\$\s\d\.]+", line))
+
+        if price_match and has_letters and not is_price_only:
+            # Inline item candidate — reject noise and watermarks
+            if is_currency_noise(line) or is_watermark_or_domain(line.strip()):
+                ignore_next_price = False
+                continue
+            ignore_next_price = False
+            inline_items.append(line)
+
+        elif price_match and is_price_only:
+            if ignore_next_price:
+                # This price belongs to an ignored line (e.g. CASH amount) — skip it
+                ignore_next_price = False
+            else:
+                standalone_prices.append(float(price_match.group(1)))
+
+        elif has_letters:
+            if is_watermark_or_domain(line.strip()):
+                continue
+            ignore_next_price = False
+            name_only_lines.append(line)
+
+        else:
+            ignore_next_price = False
+
+    return inline_items, name_only_lines, standalone_prices
+
+
 def extract_items_and_total(text):
     """
     Parse receipt OCR text into (items, total).
 
     Each item is a dict: {"name": str, "qty": int, "price": float}
 
-    Handles two common OCR layouts:
-      Layout A - price inline:      "1x Lorem ipsum $ 35.00"
-      Layout B - price on next line: "1x Lorem ipsum\\n35.00"
-
-    Also handles OCR misreading '$' as 's'/'S'.
+    Handles:
+      - Layout A: price inline      "1x Lorem ipsum $ 35.00"
+      - Layout B: price on next line "1x Lorem ipsum\\n35.00"
+      - OCR misreading '$' as 's'/'S'
+      - Orphaned CASH/CHANGE prices on separate lines
+      - Watermark/domain strings (e.g. modif.ai)
     """
     lines = [l.strip() for l in text.splitlines() if l.strip()]
 
-    # --- Step 1: find the receipt total ---
+    # Step 1: find the receipt total
     total = None
     for i, line in enumerate(lines):
         if "total" in line.lower():
@@ -164,33 +219,14 @@ def extract_items_and_total(text):
             if total is not None:
                 break
 
-    # --- Step 2: classify each line ---
-    inline_items      = []   # name + price on same line  (Layout A)
-    name_only_lines   = []   # name only                  (Layout B)
-    standalone_prices = []   # price only                 (Layout B)
+    # Step 2: classify lines
+    inline_items, name_only_lines, standalone_prices = _classify_lines(lines)
 
-    for line in lines:
-        if is_ignored_line(line):
-            continue
-
-        has_letters   = bool(re.search(r"[a-zA-Z]", line))
-        price_match   = PRICE_RE.search(line)
-        is_price_only = bool(re.fullmatch(r"[\$\s\d\.]+", line))
-
-        if price_match and has_letters and not is_price_only:
-            if is_currency_noise(line):
-                continue                          # drop "s 117.00" noise lines
-            inline_items.append(line)
-        elif price_match and is_price_only:
-            standalone_prices.append(float(price_match.group(1)))
-        elif has_letters:
-            name_only_lines.append(line)
-
-    # --- Step 3: build structured item list ---
+    # Step 3: build structured item list
     items = []
 
     if inline_items:
-        # Layout A: strip price (and any trailing lone 's' left by $ misread) from line
+        # Layout A: strip price (and any trailing lone 's' from $ misread) from line
         for line in inline_items:
             m = PRICE_RE.search(line)
             price    = float(m.group(1))
@@ -268,7 +304,6 @@ async def request_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except ValueError as exc:
         await update.message.reply_text(str(exc))
         return
-
     user = update.effective_user
     cursor.execute(
         "INSERT INTO requests (user_id, username, item, link, price, status) VALUES (?, ?, ?, ?, ?, ?)",
@@ -292,7 +327,6 @@ async def approve_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except ValueError:
         await update.message.reply_text("Request ID must be an integer.")
         return
-
     cursor.execute("SELECT status FROM requests WHERE id=?", (request_id,))
     row = cursor.fetchone()
     if not row:
@@ -301,7 +335,6 @@ async def approve_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if row[0] == "APPROVED":
         await update.message.reply_text(f"Request #{request_id} is already approved.")
         return
-
     cursor.execute("UPDATE requests SET status='APPROVED' WHERE id=?", (request_id,))
     conn.commit()
     await update.message.reply_text(f"Request #{request_id} APPROVED.")
@@ -319,7 +352,6 @@ async def reject_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except ValueError:
         await update.message.reply_text("Request ID must be an integer.")
         return
-
     cursor.execute("SELECT status FROM requests WHERE id=?", (request_id,))
     row = cursor.fetchone()
     if not row:
@@ -328,7 +360,6 @@ async def reject_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if row[0] == "REJECTED":
         await update.message.reply_text(f"Request #{request_id} is already rejected.")
         return
-
     cursor.execute("UPDATE requests SET status='REJECTED' WHERE id=?", (request_id,))
     conn.commit()
     await update.message.reply_text(f"Request #{request_id} REJECTED.")
@@ -360,7 +391,6 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except ValueError:
         await update.message.reply_text("Request ID must be an integer.")
         return
-
     cursor.execute("SELECT * FROM requests WHERE id=?", (request_id,))
     row = cursor.fetchone()
     if not row:
