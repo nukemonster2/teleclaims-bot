@@ -258,6 +258,71 @@ def extract_items_and_total(text):
 
     IGNORE = {
         "cash", "change", "subtotal", "tax",
+        "total", "amount", "receipt",
+        "thank you"
+    }
+
+    def is_price(line):
+        return re.fullmatch(r"\$?\s*\d+\.\d{2}", line) is not None
+
+    def is_junk_item(line):
+        lower = line.lower()
+
+        if any(word in lower for word in IGNORE):
+            return True
+
+        if "modif" in lower:
+            return True
+
+        # ❌ reject lines that are mostly numbers/symbols
+        if not re.search(r"[a-zA-Z]", line):
+            return True
+
+        # ❌ reject lines like "s 117.00" or "117.00 something"
+        if re.match(r"^[^a-zA-Z]*\d+\.\d{2}", line):
+            return True
+
+        return False
+
+    # Step 1: classify
+    for line in lines:
+        if is_price(line):
+            price_lines.append(float(re.search(r"\d+\.\d{2}", line).group()))
+        else:
+            if not is_junk_item(line):
+                item_lines.append(line)
+
+    # Step 2: pair safely
+    items = []
+    for i in range(min(len(item_lines), len(price_lines))):
+        name = item_lines[i]
+        price = price_lines[i]
+
+        name = name.replace("lx", "1x").replace("Ix", "1x").strip()
+
+        items.append((name, price))
+
+    # Step 3: extract REAL total only
+    total = None
+    for i, line in enumerate(lines):
+        if "total" in line.lower():
+            for j in range(i + 1, len(lines)):
+                m = re.search(r"\d+\.\d{2}", lines[j])
+                if m:
+                    total = float(m.group())
+                    break
+            break
+
+    if total is None:
+        total = sum(p for _, p in items)
+
+    return items, total    lines = [l.strip() for l in text.splitlines() if l.strip()]
+
+    item_lines = []
+    price_lines = []
+
+    IGNORE = {
+        "cash", "change", "subtotal", "tax",
         "total", "amount", "receipt", "thank you"
     }
 
