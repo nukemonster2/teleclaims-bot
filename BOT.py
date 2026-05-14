@@ -105,15 +105,27 @@ def extract_text_from_ocr_response(result):
 
 
 def is_ignored_line(line):
-    """Return True if the line is a footer/summary line that should be skipped."""
+    """Return True for footer/summary lines that should be skipped."""
     lower = line.lower()
     return any(word in lower for word in IGNORE_KEYWORDS)
 
 
+def is_currency_noise(line):
+    """
+    Detect lines where the only 'letter' is a lone OCR misread of the $ symbol.
+    OCR engines frequently read '$' as 's' or 'S', producing lines like:
+      's 117.00'  or  'S 35.00'
+    After stripping the price, a real item line always has more than 1 character
+    of meaningful text remaining.
+    """
+    without_price = PRICE_RE.sub("", line).replace("$", "").strip()
+    return len(without_price) <= 1
+
+
 def _parse_name_qty(raw_name):
     """
-    Split a raw name string like '2x Lorem ipsum' into (name, qty).
-    Falls back to qty=1 if no leading quantity prefix is found.
+    Split '2x Lorem ipsum' into ('Lorem ipsum', 2).
+    Returns (raw_name, 1) if no leading quantity prefix is found.
     """
     raw_name = raw_name.replace("lx", "1x").replace("Ix", "1x").strip()
     m = QTY_RE.match(raw_name)
@@ -124,13 +136,15 @@ def _parse_name_qty(raw_name):
 
 def extract_items_and_total(text):
     """
-    Parse receipt text into (items, total).
+    Parse receipt OCR text into (items, total).
 
     Each item is a dict: {"name": str, "qty": int, "price": float}
 
     Handles two common OCR layouts:
-      Layout A - price is inline:    "1x Lorem ipsum $ 35.00"
+      Layout A - price inline:      "1x Lorem ipsum $ 35.00"
       Layout B - price on next line: "1x Lorem ipsum\\n35.00"
+
+    Also handles OCR misreading '$' as 's'/'S'.
     """
     lines = [l.strip() for l in text.splitlines() if l.strip()]
 
@@ -151,19 +165,21 @@ def extract_items_and_total(text):
                 break
 
     # --- Step 2: classify each line ---
-    inline_items    = []   # lines with both a name and a price  (Layout A)
-    name_only_lines = []   # lines with only a name              (Layout B)
-    standalone_prices = [] # lines with only a price             (Layout B)
+    inline_items      = []   # name + price on same line  (Layout A)
+    name_only_lines   = []   # name only                  (Layout B)
+    standalone_prices = []   # price only                 (Layout B)
 
     for line in lines:
         if is_ignored_line(line):
             continue
 
-        has_letters  = bool(re.search(r"[a-zA-Z]", line))
-        price_match  = PRICE_RE.search(line)
+        has_letters   = bool(re.search(r"[a-zA-Z]", line))
+        price_match   = PRICE_RE.search(line)
         is_price_only = bool(re.fullmatch(r"[\$\s\d\.]+", line))
 
         if price_match and has_letters and not is_price_only:
+            if is_currency_noise(line):
+                continue                          # drop "s 117.00" noise lines
             inline_items.append(line)
         elif price_match and is_price_only:
             standalone_prices.append(float(price_match.group(1)))
@@ -174,11 +190,12 @@ def extract_items_and_total(text):
     items = []
 
     if inline_items:
-        # Layout A: strip price from end of line, parse qty prefix from name
+        # Layout A: strip price (and any trailing lone 's' left by $ misread) from line
         for line in inline_items:
             m = PRICE_RE.search(line)
             price    = float(m.group(1))
             raw_name = PRICE_RE.sub("", line).replace("$", "").strip().rstrip("-").strip()
+            raw_name = re.sub(r"\s+[sS]$", "", raw_name).strip()
             name, qty = _parse_name_qty(raw_name)
             items.append({"name": name, "qty": qty, "price": price})
     else:
@@ -201,7 +218,6 @@ def format_receipt_table(items, total):
       --------------------------
       Lorem ipsum     1  $35.00
       Lorem ipsum     2  $15.00
-      ...
       --------------------------
       TOTAL              $117.00
     """
@@ -218,9 +234,7 @@ def format_receipt_table(items, total):
         for it in items
     ]
     footer = f"{'TOTAL':<{col_name + col_qty + 2}}  ${total:>{col_price - 1}.2f}"
-
-    lines = ["```", header, sep] + rows + [sep, footer, "```"]
-    return "\n".join(lines)
+    return "\n".join(["```", header, sep] + rows + [sep, footer, "```"])
 
 
 # ---------------------------------------------------------------------------
@@ -237,7 +251,6 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "  /help - Show this message\n"
         "Send a receipt photo and I will try to extract the text and a price."
     )
-
     if user_id in ADMIN_IDS:
         help_text += (
             "\n\n🔐 Admin Commands:\n"
@@ -246,7 +259,6 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "  /pending - Show pending requests\n"
             "  /list all - Show all requests\n"
         )
-
     await update.message.reply_text(help_text, parse_mode="Markdown")
 
 
@@ -272,11 +284,9 @@ async def approve_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ADMIN_IDS:
         await update.message.reply_text("Not authorized.")
         return
-
     if not context.args:
         await update.message.reply_text("Usage: /approve <request_id>")
         return
-
     try:
         request_id = int(context.args[0])
     except ValueError:
@@ -288,7 +298,6 @@ async def approve_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not row:
         await update.message.reply_text(f"Request #{request_id} not found.")
         return
-
     if row[0] == "APPROVED":
         await update.message.reply_text(f"Request #{request_id} is already approved.")
         return
@@ -302,11 +311,9 @@ async def reject_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ADMIN_IDS:
         await update.message.reply_text("Not authorized.")
         return
-
     if not context.args:
         await update.message.reply_text("Usage: /reject <request_id>")
         return
-
     try:
         request_id = int(context.args[0])
     except ValueError:
@@ -318,7 +325,6 @@ async def reject_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not row:
         await update.message.reply_text(f"Request #{request_id} not found.")
         return
-
     if row[0] == "REJECTED":
         await update.message.reply_text(f"Request #{request_id} is already rejected.")
         return
@@ -336,12 +342,10 @@ async def list_requests(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "SELECT * FROM requests WHERE user_id=? ORDER BY id",
             (update.effective_user.id,),
         )
-
     rows = cursor.fetchall()
     if not rows:
         await update.message.reply_text("No requests found.")
         return
-
     message = "\n\n".join(format_request(row) for row in rows)
     for chunk in chunk_text(message):
         await update.message.reply_text(chunk)
@@ -351,7 +355,6 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
         await update.message.reply_text("Usage: /status <request_id>")
         return
-
     try:
         request_id = int(context.args[0])
     except ValueError:
@@ -363,11 +366,9 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not row:
         await update.message.reply_text(f"Request #{request_id} not found.")
         return
-
     if row[1] != update.effective_user.id and update.effective_user.id not in ADMIN_IDS:
         await update.message.reply_text("You can only view your own requests.")
         return
-
     await update.message.reply_text(format_request(row))
 
 
@@ -375,13 +376,11 @@ async def pending_requests(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ADMIN_IDS:
         await update.message.reply_text("Not authorized.")
         return
-
     cursor.execute("SELECT * FROM requests WHERE status='PENDING' ORDER BY id")
     rows = cursor.fetchall()
     if not rows:
         await update.message.reply_text("No pending requests.")
         return
-
     message = "\n\n".join(format_request(row) for row in rows)
     for chunk in chunk_text(message):
         await update.message.reply_text(chunk)
@@ -391,7 +390,6 @@ async def upload_receipt(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message.photo:
         await update.message.reply_text("Please send a photo of the receipt.")
         return
-
     if not OCR_API_KEY:
         await update.message.reply_text("OCR is disabled because OCR_API_KEY is not set.")
         return
@@ -427,7 +425,6 @@ async def upload_receipt(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     items, total = extract_items_and_total(text)
-
     if not items:
         await update.message.reply_text(f"Extracted text:\n{text}\n\nNo item prices detected.")
         return
