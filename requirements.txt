@@ -1,2 +1,7 @@
 python-telegram-bot[webhooks]==20.3
 requests
+paddleocr
+paddlepaddle
+opencv-python
+numpy
+Pillow
