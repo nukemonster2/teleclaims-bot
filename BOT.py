@@ -62,7 +62,7 @@ def chunk_text(text, limit=4000):
         if split_at > 0 and len(text) > limit:
             part = text[:split_at]
         chunks.append(part)
-        text = text[len(part) :].lstrip()
+        text = text[len(part):].lstrip()
     return chunks
 
 
@@ -249,62 +249,68 @@ def extract_text_from_ocr_response(result):
         return None
     return parsed[0].get("ParsedText")
 
+
 def extract_items_and_total(text):
     lines = [l.strip() for l in text.splitlines() if l.strip()]
 
-    item_lines = []
-    price_lines = []
-
-    IGNORE = {
+    IGNORE_KEYWORDS = {
         "cash", "change", "subtotal", "tax",
-        "total", "amount", "receipt",
-        "thank you"
+        "total", "amount", "receipt", "thank you"
     }
 
-    def is_price(line):
+    def is_standalone_price(line):
+        """Line is purely a price value with no item name."""
         return re.fullmatch(r"\$?\s*\d+\.\d{2}", line) is not None
 
     def is_junk_item(line):
         lower = line.lower()
 
-        if any(word in lower for word in IGNORE):
+        # Reject lines containing ignored keywords
+        if any(word in lower for word in IGNORE_KEYWORDS):
             return True
 
+        # Reject modifier/adjustment lines
         if "modif" in lower:
             return True
 
-        # ❌ reject lines that are mostly numbers/symbols
+        # Reject lines with no letters at all
         if not re.search(r"[a-zA-Z]", line):
             return True
 
-        # ❌ reject lines like "s 117.00" or "117.00 something"
-        if re.match(r"^[^a-zA-Z]*\d+\.\d{2}", line):
+        # FIX: Reject lines where a price appears very early (e.g. "s 117.00", "117.00 item")
+        # Allow at most 3 non-alpha characters before the first digit of a price pattern
+        if re.match(r"^[^a-zA-Z]{0,3}\d+\.\d{2}", line):
             return True
 
         return False
 
-    # Step 1: classify
-    for line in lines:
-        if is_price(line):
-            price_lines.append(float(re.search(r"\d+\.\d{2}", line).group()))
-        else:
-            if not is_junk_item(line):
-                item_lines.append(line)
+    item_lines = []
+    price_lines = []
 
-    # Step 2: pair safely
+    for line in lines:
+        if is_standalone_price(line):
+            price_lines.append(float(re.search(r"\d+\.\d{2}", line).group()))
+        elif not is_junk_item(line):
+            item_lines.append(line)
+
+    # Pair item names with prices
     items = []
     for i in range(min(len(item_lines), len(price_lines))):
         name = item_lines[i]
         price = price_lines[i]
-
         name = name.replace("lx", "1x").replace("Ix", "1x").strip()
-
         items.append((name, price))
 
-    # Step 3: extract REAL total only
+    # FIX: Extract total — check the "total" line itself first, then the next line
     total = None
     for i, line in enumerate(lines):
         if "total" in line.lower():
+            # Price may be on the same line (e.g. "TOTAL AMOUNT $ 117.00")
+            m = re.search(r"\d+\.\d{2}", line)
+            if m:
+                total = float(m.group())
+                break
+            # Otherwise check the next line
             for j in range(i + 1, len(lines)):
                 m = re.search(r"\d+\.\d{2}", lines[j])
                 if m:
@@ -312,10 +318,12 @@ def extract_items_and_total(text):
                     break
             break
 
+    # Final fallback: sum up the extracted item prices
     if total is None:
         total = sum(p for _, p in items)
 
     return items, total
+
 
 async def upload_receipt(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message.photo:
@@ -364,16 +372,8 @@ async def upload_receipt(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    formatted = "\n".join(
-        [f"{name} - ${price:.2f}" for name, price in items]
-    )
-
-    message = (
-        f"Extracted items:\n\n"
-        f"{formatted}\n\n"
-        f"TOTAL: ${total:.2f}"
-    )
-
+    formatted = "\n".join(f"{name} - ${price:.2f}" for name, price in items)
+    message = f"Extracted items:\n\n{formatted}\n\nTOTAL: ${total:.2f}"
     await update.message.reply_text(message)
 
 
