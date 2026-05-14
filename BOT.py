@@ -249,7 +249,6 @@ def extract_text_from_ocr_response(result):
         return None
     return parsed[0].get("ParsedText")
 
-
 def extract_items_and_total(text):
     lines = [l.strip() for l in text.splitlines() if l.strip()]
 
@@ -312,63 +311,6 @@ def extract_items_and_total(text):
                     total = float(m.group())
                     break
             break
-
-    if total is None:
-        total = sum(p for _, p in items)
-
-    return items, total    lines = [l.strip() for l in text.splitlines() if l.strip()]
-
-    item_lines = []
-    price_lines = []
-
-    IGNORE = {
-        "cash", "change", "subtotal", "tax",
-        "total", "amount", "receipt", "thank you"
-    }
-
-    for line in lines:
-        lower = line.lower()
-
-        # skip watermark / junk
-        if "modif" in lower:
-            continue
-
-        if any(word in lower for word in IGNORE):
-            continue
-
-        # price line
-        if re.fullmatch(r"\$?\s*\d+\.\d{2}", line):
-            price_lines.append(float(re.search(r"\d+\.\d{2}", line).group()))
-            continue
-
-        # item line must contain letters
-        if re.search(r"[a-zA-Z]", line):
-            item_lines.append(line)
-
-    # pair safely
-    items = []
-    for i in range(min(len(item_lines), len(price_lines))):
-        name = item_lines[i]
-        price = price_lines[i]
-
-        # fix OCR issues
-        name = (
-            name.replace("lx", "1x")
-                .replace("Ix", "1x")
-                .strip()
-        )
-
-        items.append((name, price))
-
-    # detect TOTAL properly (ONLY from TOTAL line context)
-    total = None
-    for i, line in enumerate(lines):
-        if "total" in line.lower():
-            for j in range(i + 1, min(i + 3, len(lines))):
-                match = re.search(r"\d+\.\d{2}", lines[j])
-                if match:
-                    total = float(match.group())
-                    break
 
     if total is None:
         total = sum(p for _, p in items)
