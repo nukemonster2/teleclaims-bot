@@ -93,11 +93,19 @@ async def webhook(req: Request):
 
 @app_web.on_event("startup")
 async def on_start():
+    await tg_app.initialize()
+
     webhook_url = f"{BASE_URL}/webhook"
     await tg_app.bot.set_webhook(webhook_url)
+
     logger.info(f"Webhook set to {webhook_url}")
 
 # ---------------- RUN ----------------
 
 if __name__ == "__main__":
-    uvicorn.run(app_web, host="0.0.0.0", port=PORT)
+    import uvicorn
+    uvicorn.run(
+        app_web,
+        host="0.0.0.0",
+        port=int(os.environ.get("PORT", 10000))
+    )
