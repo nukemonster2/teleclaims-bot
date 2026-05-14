@@ -15,7 +15,7 @@ from paddleocr import PaddleOCR
 # ---------------- CONFIG ----------------
 
 TOKEN = os.getenv("TOKEN")
-BASE_URL = os.getenv("BASE_URL")  # your Render URL like https://xxx.onrender.com
+BASE_URL = os.getenv("RENDER_EXTERNAL_URL")  # your Render URL like https://xxx.onrender.com
 PORT = int(os.getenv("PORT", 10000))
 
 if not TOKEN or not BASE_URL:
