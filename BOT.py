@@ -201,20 +201,7 @@ def build_app():
 
     return app
 
-
 def run():
     app = build_app()
-
-    if RENDER_EXTERNAL_URL:
-        app.run_webhook(
-            listen="0.0.0.0",
-            port=PORT,
-            url_path=TOKEN,
-            webhook_url=f"{RENDER_EXTERNAL_URL}/{TOKEN}",
-        )
-    else:
-        app.run_polling()
-
-
-if __name__ == "__main__":
-    run()
+    logger.info("Bot running in polling mode")
+    app.run_polling()
