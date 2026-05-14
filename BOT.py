@@ -250,10 +250,27 @@ def extract_text_from_ocr_response(result):
     return parsed[0].get("ParsedText")
 
 
-def extract_price(text):
-    prices = re.findall(r"\d+\.\d{2}", text or "")
-    return prices[0] if prices else "N/A"
+def extract_items_and_total(text):
+    lines = text.splitlines()
 
+    items = []
+    total = 0.0
+
+    for line in lines:
+        # Match: item name + price
+        # Example:
+        # Burger 12.50
+        # Coke 2.00
+        match = re.search(r"(.+?)\s+(\d+\.\d{2})$", line.strip())
+
+        if match:
+            item_name = match.group(1).strip()
+            price = float(match.group(2))
+
+            items.append((item_name, price))
+            total += price
+
+    return items, total
 
 async def upload_receipt(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message.photo:
@@ -294,8 +311,25 @@ async def upload_receipt(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("OCR did not detect any text. Please try a clearer image.")
         return
 
-    price = extract_price(text)
-    await update.message.reply_text(f"Extracted text:\n{text}\n\nDetected price: {price}")
+    items, total = extract_items_and_total(text)
+
+    if not items:
+        await update.message.reply_text(
+            f"Extracted text:\n{text}\n\nNo item prices detected."s
+        )
+        return
+
+    formatted = "\n".join(
+        [f"{name} - ${price:.2f}" for name, price in items]
+    )
+
+    message = (
+        f"Extracted items:\n\n"
+        f"{formatted}\n\n"
+        f"TOTAL: ${total:.2f}"
+    )
+
+    await update.message.reply_text(message)
 
 
 def build_application():
