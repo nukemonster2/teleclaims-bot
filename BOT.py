@@ -47,6 +47,7 @@ conn.commit()
 # ---------------------------------------------------------------------------
 
 PRICE_RE = re.compile(r"\$?\s*(\d+\.\d{2})")
+QTY_RE   = re.compile(r"^(\d+)\s*x\s+", re.IGNORECASE)
 IGNORE_KEYWORDS = {"cash", "change", "subtotal", "tax", "total", "amount", "receipt", "thank you"}
 
 
@@ -109,9 +110,23 @@ def is_ignored_line(line):
     return any(word in lower for word in IGNORE_KEYWORDS)
 
 
+def _parse_name_qty(raw_name):
+    """
+    Split a raw name string like '2x Lorem ipsum' into (name, qty).
+    Falls back to qty=1 if no leading quantity prefix is found.
+    """
+    raw_name = raw_name.replace("lx", "1x").replace("Ix", "1x").strip()
+    m = QTY_RE.match(raw_name)
+    if m:
+        return raw_name[m.end():].strip(), int(m.group(1))
+    return raw_name, 1
+
+
 def extract_items_and_total(text):
     """
     Parse receipt text into (items, total).
+
+    Each item is a dict: {"name": str, "qty": int, "price": float}
 
     Handles two common OCR layouts:
       Layout A - price is inline:    "1x Lorem ipsum $ 35.00"
@@ -123,12 +138,10 @@ def extract_items_and_total(text):
     total = None
     for i, line in enumerate(lines):
         if "total" in line.lower():
-            # Price may be on the same line: "TOTAL AMOUNT $ 117.00"
             m = PRICE_RE.search(line)
             if m:
                 total = float(m.group(1))
                 break
-            # Otherwise check up to 2 lines ahead
             for j in range(i + 1, min(i + 3, len(lines))):
                 m = PRICE_RE.search(lines[j])
                 if m:
@@ -138,50 +151,76 @@ def extract_items_and_total(text):
                 break
 
     # --- Step 2: classify each line ---
-    inline_items = []       # lines with both a name and a price  (Layout A)
-    name_only_lines = []    # lines with only a name              (Layout B)
-    standalone_prices = []  # lines with only a price             (Layout B)
+    inline_items    = []   # lines with both a name and a price  (Layout A)
+    name_only_lines = []   # lines with only a name              (Layout B)
+    standalone_prices = [] # lines with only a price             (Layout B)
 
     for line in lines:
         if is_ignored_line(line):
             continue
 
-        has_letters = bool(re.search(r"[a-zA-Z]", line))
-        price_match = PRICE_RE.search(line)
+        has_letters  = bool(re.search(r"[a-zA-Z]", line))
+        price_match  = PRICE_RE.search(line)
         is_price_only = bool(re.fullmatch(r"[\$\s\d\.]+", line))
 
         if price_match and has_letters and not is_price_only:
-            # Layout A: "1x Lorem ipsum $ 35.00"
             inline_items.append(line)
         elif price_match and is_price_only:
-            # Layout B price line: "35.00"
             standalone_prices.append(float(price_match.group(1)))
         elif has_letters:
-            # Layout B name line: "1x Lorem ipsum"
             name_only_lines.append(line)
 
-    # --- Step 3: build item list from whichever layout was detected ---
+    # --- Step 3: build structured item list ---
     items = []
 
     if inline_items:
-        # Layout A: strip the price from the end of the line to get the item name
+        # Layout A: strip price from end of line, parse qty prefix from name
         for line in inline_items:
             m = PRICE_RE.search(line)
-            price = float(m.group(1))
-            name = PRICE_RE.sub("", line).replace("$", "").strip().rstrip("-").strip()
-            name = name.replace("lx", "1x").replace("Ix", "1x")
-            items.append((name, price))
+            price    = float(m.group(1))
+            raw_name = PRICE_RE.sub("", line).replace("$", "").strip().rstrip("-").strip()
+            name, qty = _parse_name_qty(raw_name)
+            items.append({"name": name, "qty": qty, "price": price})
     else:
         # Layout B: pair name lines with standalone price lines in order
         for i in range(min(len(name_only_lines), len(standalone_prices))):
-            name = name_only_lines[i].replace("lx", "1x").replace("Ix", "1x").strip()
-            items.append((name, standalone_prices[i]))
+            name, qty = _parse_name_qty(name_only_lines[i])
+            items.append({"name": name, "qty": qty, "price": standalone_prices[i]})
 
-    # Fallback: if no total was found, sum the item prices
     if total is None:
-        total = sum(p for _, p in items)
+        total = sum(it["price"] for it in items)
 
     return items, total
+
+
+def format_receipt_table(items, total):
+    """
+    Build a Telegram monospace table:
+
+      Item          Qty   Price
+      --------------------------
+      Lorem ipsum     1  $35.00
+      Lorem ipsum     2  $15.00
+      ...
+      --------------------------
+      TOTAL              $117.00
+    """
+    col_name  = max((len(it["name"]) for it in items), default=4)
+    col_name  = max(col_name, 4)
+    col_qty   = 3
+    col_price = max((len(f"${it['price']:.2f}") for it in items), default=5)
+    col_price = max(col_price, 5)
+
+    header = f"{'Item':<{col_name}}  {'Qty':>{col_qty}}  {'Price':>{col_price}}"
+    sep    = "-" * len(header)
+    rows   = [
+        f"{it['name']:<{col_name}}  {it['qty']:>{col_qty}}  ${it['price']:>{col_price - 1}.2f}"
+        for it in items
+    ]
+    footer = f"{'TOTAL':<{col_name + col_qty + 2}}  ${total:>{col_price - 1}.2f}"
+
+    lines = ["```", header, sep] + rows + [sep, footer, "```"]
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -393,8 +432,7 @@ async def upload_receipt(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"Extracted text:\n{text}\n\nNo item prices detected.")
         return
 
-    formatted = "\n".join(f"{name} - ${price:.2f}" for name, price in items)
-    await update.message.reply_text(f"Extracted items:\n\n{formatted}\n\nTOTAL: ${total:.2f}")
+    await update.message.reply_text(format_receipt_table(items, total), parse_mode="Markdown")
 
 
 # ---------------------------------------------------------------------------
