@@ -91,38 +91,44 @@ def is_noise(line: str) -> bool:
 
 
 def extract_items_and_total(text: str):
-    lines = [clean_line(l) for l in text.splitlines() if l.strip()]
+    lines = [l.strip() for l in text.splitlines() if l.strip()]
 
     items = []
     total = None
 
-    for i, line in enumerate(lines):
+    for line in lines:
+        lower = line.lower()
 
-        if is_noise(line):
+        # capture total safely
+        if "total" in lower:
             m = PRICE_RE.search(line)
-            if "total" in line.lower() and m:
+            if m:
                 total = float(m.group(1))
             continue
 
-        price_match = PRICE_RE.search(line)
-        if not price_match:
+        # ignore footer noise
+        if any(k in lower for k in ["cash", "change", "subtotal", "tax", "thank"]):
             continue
 
-        price = float(price_match.group(1))
+        m = PRICE_RE.search(line)
+        if not m:
+            continue
 
-        # detect name part
-        name = PRICE_RE.sub("", line).replace("$", "").strip()
+        price = float(m.group(1))
 
-        # REMOVE unreliable qty logic (critical fix)
-        name = re.sub(r"^\d+\s*x\s+", "", name, flags=re.IGNORECASE)
+        # remove price from name
+        name = PRICE_RE.sub("", line)
+        name = name.replace("$", "").strip()
 
-        # skip garbage
+        # remove fake qty like "2x"
+        name = re.sub(r"^\d+\s*x\s*", "", name, flags=re.IGNORECASE)
+
         if len(name) < 2:
             continue
 
         items.append({
             "name": name,
-            "qty": 1,   # IMPORTANT: treat as line item price
+            "qty": 1,
             "price": price
         })
 
@@ -130,10 +136,6 @@ def extract_items_and_total(text: str):
 
     if total is None:
         total = computed_total
-    else:
-        # sanity check
-        if abs(total - computed_total) > 0.01:
-            logger.warning(f"Mismatch OCR={total} computed={computed_total}")
 
     return items, total
 
