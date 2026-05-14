@@ -1,153 +1,50 @@
 import os
 import re
-import sqlite3
-import tempfile
 import logging
-import threading
+import tempfile
+import sqlite3
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 import uvicorn
 
 from telegram import Update
-from telegram.ext import (
-    ApplicationBuilder,
-    CommandHandler,
-    MessageHandler,
-    ContextTypes,
-    filters,
-)
+from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
 
 from paddleocr import PaddleOCR
 
-# -------------------------------------------------------------------
-# CONFIG
-# -------------------------------------------------------------------
+# ---------------- CONFIG ----------------
 
 TOKEN = os.getenv("TOKEN")
+BASE_URL = os.getenv("BASE_URL")  # your Render URL like https://xxx.onrender.com
 PORT = int(os.getenv("PORT", 10000))
 
-if not TOKEN:
-    raise SystemExit("Missing TOKEN")
+if not TOKEN or not BASE_URL:
+    raise SystemExit("Missing TOKEN or BASE_URL")
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# -------------------------------------------------------------------
-# FASTAPI (Render needs this)
-# -------------------------------------------------------------------
-
 app_web = FastAPI()
 
-@app_web.get("/")
-def health():
-    return {"status": "ok"}
-
-# -------------------------------------------------------------------
-# LAZY OCR (IMPORTANT FOR RENDER)
-# -------------------------------------------------------------------
+# ---------------- OCR (lazy load) ----------------
 
 ocr = None
 
 def get_ocr():
     global ocr
     if ocr is None:
-        logger.info("Loading PaddleOCR model...")
+        logger.info("Loading OCR...")
         ocr = PaddleOCR(use_angle_cls=True, lang="en")
     return ocr
 
-# -------------------------------------------------------------------
-# DATABASE
-# -------------------------------------------------------------------
+# ---------------- TELEGRAM APP ----------------
 
-conn = sqlite3.connect("claims.db", check_same_thread=False)
-cursor = conn.cursor()
-
-cursor.execute("""
-CREATE TABLE IF NOT EXISTS requests (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id INTEGER,
-    username TEXT,
-    item TEXT,
-    link TEXT,
-    price REAL,
-    status TEXT
-)
-""")
-conn.commit()
-
-# -------------------------------------------------------------------
-# OCR PARSER HELPERS
-# -------------------------------------------------------------------
-
-PRICE_RE = re.compile(r"\$?\s*(\d+\.\d{2})")
-IGNORE_WORDS = {"cash", "change", "subtotal", "tax", "total", "thank"}
-
-def clean_lines(text: str):
-    return [l.strip() for l in text.split("\n") if l.strip()]
-
-def extract_items_and_total(text: str):
-    lines = clean_lines(text)
-
-    items = []
-    total = None
-
-    for line in lines:
-        low = line.lower()
-
-        if "total" in low:
-            m = PRICE_RE.search(line)
-            if m:
-                total = float(m.group(1))
-            continue
-
-        if any(w in low for w in IGNORE_WORDS):
-            continue
-
-        m = PRICE_RE.search(line)
-        if not m:
-            continue
-
-        price = float(m.group(1))
-        name = PRICE_RE.sub("", line).replace("$", "").strip()
-        name = re.sub(r"^\d+\s*x\s*", "", name, flags=re.IGNORECASE)
-
-        if len(name) < 2:
-            continue
-
-        items.append({"name": name, "price": price})
-
-    computed_total = sum(i["price"] for i in items)
-    if total is None:
-        total = computed_total
-
-    return items, total
-
-def format_receipt(items, total):
-    col = max((len(i["name"]) for i in items), default=10)
-
-    header = f"{'Item':<{col}}  {'Price':>10}"
-    sep = "-" * len(header)
-
-    rows = [
-        f"{i['name']:<{col}}  ${i['price']:>9.2f}"
-        for i in items
-    ]
-
-    footer = f"{'TOTAL':<{col}}  ${total:>9.2f}"
-
-    return "```\n" + "\n".join([header, sep] + rows + [sep, footer]) + "\n```"
-
-# -------------------------------------------------------------------
-# TELEGRAM HANDLERS
-# -------------------------------------------------------------------
+tg_app = ApplicationBuilder().token(TOKEN).build()
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Receipt bot is running.")
+    await update.message.reply_text("Bot is live.")
 
 async def upload_receipt(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message.photo:
-        return await update.message.reply_text("Send a receipt image.")
-
     file = await update.message.photo[-1].get_file()
 
     with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as f:
@@ -155,19 +52,17 @@ async def upload_receipt(update: Update, context: ContextTypes.DEFAULT_TYPE):
         path = f.name
 
     try:
-        ocr_engine = get_ocr()
-        result = ocr_engine.ocr(path, cls=True)
+        result = get_ocr().ocr(path, cls=True)
 
-        lines = []
-        for block in result:
-            for line in block:
-                lines.append(line[1][0])
-
-        text = "\n".join(lines)
+        text = "\n".join(
+            line[1][0]
+            for block in result
+            for line in block
+        )
 
     except Exception as e:
         logger.exception(e)
-        return await update.message.reply_text("OCR failed.")
+        return await update.message.reply_text("OCR failed")
 
     finally:
         try:
@@ -175,41 +70,34 @@ async def upload_receipt(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except:
             pass
 
-    items, total = extract_items_and_total(text)
+    await update.message.reply_text(f"OCR:\n{text}")
 
-    if not items:
-        return await update.message.reply_text(
-            f"OCR TEXT:\n{text}\n\nNo items detected."
-        )
+tg_app.add_handler(CommandHandler("start", start))
+tg_app.add_handler(MessageHandler(filters.PHOTO, upload_receipt))
 
-    await update.message.reply_text(
-        format_receipt(items, total),
-        parse_mode="Markdown"
-    )
+# ---------------- FASTAPI ----------------
 
-# -------------------------------------------------------------------
-# TELEGRAM APP
-# -------------------------------------------------------------------
+@app_web.get("/")
+def home():
+    return {"status": "ok"}
 
-def build_bot():
-    app = ApplicationBuilder().token(TOKEN).build()
+@app_web.post("/webhook")
+async def webhook(req: Request):
+    data = await req.json()
+    update = Update.de_json(data, tg_app.bot)
 
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.PHOTO, upload_receipt))
+    await tg_app.process_update(update)
+    return {"ok": True}
 
-    return app
+# ---------------- SET WEBHOOK ----------------
 
-def run_bot():
-    bot = build_bot()
-    logger.info("Bot running (polling mode)")
-    bot.run_polling()
+@app_web.on_event("startup")
+async def on_start():
+    webhook_url = f"{BASE_URL}/webhook"
+    await tg_app.bot.set_webhook(webhook_url)
+    logger.info(f"Webhook set to {webhook_url}")
 
-# -------------------------------------------------------------------
-# ENTRYPOINT (RENDER SAFE)
-# -------------------------------------------------------------------
+# ---------------- RUN ----------------
 
 if __name__ == "__main__":
-    threading.Thread(target=run_bot).start()
-
-    logger.info("Starting FastAPI server...")
     uvicorn.run(app_web, host="0.0.0.0", port=PORT)
