@@ -254,7 +254,6 @@ def extract_items_and_total(text):
     lines = text.splitlines()
 
     items = []
-    calculated_total = 0.0
     detected_total = None
 
     IGNORE_WORDS = {
@@ -262,13 +261,21 @@ def extract_items_and_total(text):
         "change",
         "subtotal",
         "tax",
+        "amount",
+        "balance",
+        "visa",
+        "mastercard",
     }
 
     for line in lines:
         line = line.strip()
 
-        # Match lines ending in a price
-        match = re.search(r"(.+?)\s+\$?\s*(\d+\.\d{2})$", line)
+        # Skip empty or tiny garbage lines
+        if len(line) < 4:
+            continue
+
+        # Match item + price
+        match = re.search(r"^(.+?)\s+\$?\s*(\d+\.\d{2})$", line)
 
         if not match:
             continue
@@ -278,21 +285,32 @@ def extract_items_and_total(text):
 
         lower_name = item_name.lower()
 
-        # Detect explicit TOTAL separately
+        # Ignore broken OCR symbols
+        if lower_name in {"$", "s"}:
+            continue
+
+        # Detect TOTAL separately
         if "total" in lower_name:
             detected_total = price
             continue
 
-        # Ignore payment lines
-        if lower_name in IGNORE_WORDS:
+        # Ignore non-item payment lines
+        if any(word in lower_name for word in IGNORE_WORDS):
+            continue
+
+        # Require actual letters in item name
+        if not re.search(r"[a-zA-Z]", item_name):
             continue
 
         items.append((item_name, price))
-        calculated_total += price
 
-    final_total = detected_total if detected_total is not None else calculated_total
+    # Use detected total if available
+    if detected_total is not None:
+        total = detected_total
+    else:
+        total = sum(price for _, price in items)
 
-    return items, final_total
+    return items, total
 
 async def upload_receipt(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message.photo:
