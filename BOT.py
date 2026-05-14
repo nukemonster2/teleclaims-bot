@@ -315,7 +315,7 @@ async def upload_receipt(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not items:
         await update.message.reply_text(
-            f"Extracted text:\n{text}\n\nNo item prices detected."s
+            f"Extracted text:\n{text}\n\nNo item prices detected."
         )
         return
 
